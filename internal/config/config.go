@@ -75,6 +75,12 @@ func configPaths() []string {
 	return paths
 }
 
+// ConfigDirs lists the directories searched for user assets (themes,
+// lexers), nearest-wins: the binary's own config/ dir, then ~/.config/ttt.
+func ConfigDirs() []string {
+	return configPaths()
+}
+
 func ListThemes() []string {
 	seen := make(map[string]bool)
 	var names []string

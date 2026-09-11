@@ -7,6 +7,30 @@ description: Core editing features in TTT.
 
 TTT uses [chroma](https://github.com/alecthomas/chroma) for syntax highlighting, supporting hundreds of languages with automatic detection based on file extension.
 
+Highlighting is line-based, with multi-line regions carried across lines: a
+block comment, a docstring, a template literal or a raw string keeps its color
+until its closing delimiter, however many lines later that is.
+
+### Adding a language
+
+A language chroma does not ship can be added without rebuilding TTT. Drop a
+[serialised chroma lexer](https://github.com/alecthomas/chroma/tree/master/lexers/embedded)
+(an XML file) into a `lexers/` folder in either config directory:
+
+```sh
+mkdir -p ~/.config/ttt/lexers
+cp mylang.xml ~/.config/ttt/lexers/
+```
+
+Files are matched by the `<filename>` globs inside the XML, and a lexer found
+in `~/.config/ttt` wins over one of the same name next to the binary. The new
+language works everywhere highlighting does: editor tabs, diff views, commit
+detail, readonly previews, and fenced code blocks in Markdown.
+
+A lexer that fails to parse, or that panics while tokenising, is rejected at
+startup with a line in the **Output** panel; the file keeps its default colors
+rather than taking the editor down.
+
 ## Bracket Matching
 
 Matching brackets are highlighted automatically when the cursor is on a bracket character. Press **Ctrl+K M** to jump to the matching bracket.

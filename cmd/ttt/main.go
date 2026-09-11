@@ -15,6 +15,7 @@ import (
 	"github.com/eugenioenko/ttt/internal/config"
 	"github.com/eugenioenko/ttt/internal/core/clipboard"
 	"github.com/eugenioenko/ttt/internal/github"
+	"github.com/eugenioenko/ttt/internal/highlight"
 	"github.com/eugenioenko/ttt/internal/lsp"
 	"github.com/eugenioenko/ttt/internal/plugin"
 	"github.com/eugenioenko/ttt/internal/render"
@@ -246,6 +247,12 @@ Docs: https://tttedit.dev
 	editor.Running = &running
 	app.RegisterCommands(editor)
 	app.BindKeys(editor.Root, cmdRegistry, cfg.Keybindings)
+
+	// A lexer dropped in ~/.config/ttt/lexers/ that chroma refuses is silent
+	// otherwise: the file simply keeps its default colors.
+	for _, err := range highlight.ExternalLexerErrors() {
+		editor.LogOutput("error", "lexers", err.Error())
+	}
 
 	registryPath := config.ConfigFilePath("plugins.ttt.json")
 	pluginsDir := filepath.Join(filepath.Dir(registryPath), "plugins")
