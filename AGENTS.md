@@ -36,7 +36,7 @@ Known boundary violations and explicit boundary decisions are documented there. 
   - `cursor/` — Visual column cursor with goal-column preservation for vertical movement
   - `undo/` — Command-pattern undo/redo via `EditCommand` interface (InsertRune, DeleteRange, InsertLine)
 
-- **`internal/highlight/`** — Presentation-owned per-line syntax highlighting via `chroma/v2` lexers. Owns language selection, lexer-state detection, caching, and mapping Chroma token types to `term.Style`. Full-buffer re-lexing is a known performance trap — avoid it.
+- **`internal/highlight/`** — Presentation-owned per-line syntax highlighting via `chroma/v2` lexers. Owns language selection, multi-line region state (block comments, docstrings, template and raw strings, each discovered by probing the lexer), caching, external lexer loading from `<config dir>/lexers/*.xml` (`external.go`), and mapping Chroma token types to `term.Style`. Full-buffer re-lexing is a known performance trap — avoid it. `cmd/lexcheck` runs the real highlighter over a file to verify a lexer, dumping spans or checking a `<line>|<substring>|<style>` assertion file.
 
 - **`internal/view/`** — Viewport (scrolling, cursor-to-screen mapping) and status bar rendering
 

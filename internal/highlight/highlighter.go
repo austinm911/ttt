@@ -1,11 +1,13 @@
 package highlight
 
 import (
-	"github.com/eugenioenko/ttt/internal/term"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/lexers"
+
+	"github.com/eugenioenko/ttt/internal/term"
 )
 
 type Span struct {
@@ -14,26 +16,59 @@ type Span struct {
 	Style term.Style
 }
 
+// noRegion marks a line that starts outside every multi-line region.
+const noRegion int8 = -1
+
 // spanKey keys the span cache; the same text differs by incoming state.
 type spanKey struct {
-	line    string
-	inBlock bool
+	line   string
+	region int8
 }
+
+// A region is a delimiter pair the language lets span lines: a block comment,
+// a docstring, a raw or template string. ttt tokenises one line at a time and
+// chroma exposes no way to resume a lexer's state stack on the next line, so a
+// line that starts inside a region is coloured from the region's own style
+// until its closing delimiter, and only the remainder is lexed.
+type region struct {
+	open  string
+	close string
+	style term.Style
+	// tokenType is what the lexer called the opening delimiter during the
+	// probe. Matching it exactly is what keeps a backtick inside a
+	// single-quoted string from opening a template literal.
+	tokenType chroma.TokenType
+	// escapes reports that a backslash escapes the closing delimiter: true for
+	// strings, false for comments, where nothing is special.
+	escapes bool
+}
+
+// openAt is where a line opens a region it never closes, region noRegion when
+// it opens none.
+type openAt struct {
+	col    int
+	region int8
+}
+
+var noOpen = openAt{col: -1, region: noRegion}
 
 type Highlighter struct {
 	lexer chroma.Lexer
 	cache map[spanKey][]Span
 
-	// Empty when the language has no block comment; state tracking is then skipped.
-	blockOpen  string
-	blockClose string
+	// Empty when the language has no multi-line region; state tracking is
+	// then skipped entirely.
+	regions []region
+	// openLeads holds the distinct first bytes of every region's opening
+	// delimiter, for the per-line prescan.
+	openLeads string
 
-	// Rune index where a line opens an unclosed block comment, -1 for none.
-	// Pure function of the text, so it survives ClearCache.
-	opens map[string]int
+	// opens memoizes where a line opens a region that outlives it. A pure
+	// function of the text, so it survives ClearCache.
+	opens map[string]openAt
 
-	// states[i] reports whether line i starts inside a block comment.
-	states []bool
+	// states[i] is the region line i starts inside, noRegion for none.
+	states []int8
 	// stateSrc[i] is the text of line i that produced states[i+1], so an edit
 	// can be located by comparison instead of discarding the whole table.
 	stateSrc []string
@@ -42,13 +77,18 @@ type Highlighter struct {
 }
 
 func New(filename string) *Highlighter {
+	externalOnce.Do(loadExternalLexers)
 	lexer := lexers.Match(filename)
 	if lexer == nil {
 		return nil
 	}
-	lexer = chroma.Coalesce(lexer)
-	h := &Highlighter{lexer: lexer}
-	h.blockOpen, h.blockClose = detectBlockComment(lexer)
+	h := &Highlighter{lexer: chroma.Coalesce(lexer)}
+	h.regions = detectRegions(lexer)
+	for _, r := range h.regions {
+		if !strings.ContainsAny(h.openLeads, r.open[:1]) {
+			h.openLeads += r.open[:1]
+		}
+	}
 	return h
 }
 
@@ -56,12 +96,12 @@ func (h *Highlighter) Language() string {
 	return h.lexer.Config().Name
 }
 
-// HighlightLine highlights a line in isolation, ignoring multiline comments.
+// HighlightLine highlights a line in isolation, ignoring multi-line regions.
 func (h *Highlighter) HighlightLine(line string) []Span {
-	return h.highlight(line, false)
+	return h.highlight(line, noRegion)
 }
 
-// HighlightLineAt highlights lines[idx], carrying block comment state down
+// HighlightLineAt highlights lines[idx], carrying multi-line region state down
 // from the top of the buffer.
 func (h *Highlighter) HighlightLineAt(lines []string, idx int) []Span {
 	if idx < 0 || idx >= len(lines) {
@@ -75,14 +115,14 @@ func (h *Highlighter) ClearCache() {
 	h.statesDirty = true
 }
 
-func (h *Highlighter) highlight(line string, inBlock bool) []Span {
-	key := spanKey{line: line, inBlock: inBlock}
+func (h *Highlighter) highlight(line string, reg int8) []Span {
+	key := spanKey{line: line, region: reg}
 	if h.cache != nil {
 		if cached, ok := h.cache[key]; ok {
 			return cached
 		}
 	}
-	spans := h.computeSpans(line, inBlock)
+	spans := h.computeSpans(line, reg)
 	if h.cache == nil {
 		h.cache = make(map[spanKey][]Span)
 	}
@@ -90,17 +130,18 @@ func (h *Highlighter) highlight(line string, inBlock bool) []Span {
 	return spans
 }
 
-func (h *Highlighter) computeSpans(line string, inBlock bool) []Span {
-	if inBlock {
-		end := h.closesAt(line)
+func (h *Highlighter) computeSpans(line string, reg int8) []Span {
+	if reg >= 0 && int(reg) < len(h.regions) {
+		r := h.regions[reg]
+		end := closesAt(line, r)
 		if end < 0 {
 			if line == "" {
 				return nil
 			}
-			return []Span{{Start: 0, End: len([]rune(line)), Style: term.StyleSyntaxComment}}
+			return []Span{{Start: 0, End: len([]rune(line)), Style: r.style}}
 		}
-		spans := []Span{{Start: 0, End: end, Style: term.StyleSyntaxComment}}
-		for _, s := range h.computeSpans(string([]rune(line)[end:]), false) {
+		spans := []Span{{Start: 0, End: end, Style: r.style}}
+		for _, s := range h.computeSpans(string([]rune(line)[end:]), noRegion) {
 			spans = append(spans, Span{Start: s.Start + end, End: s.End + end, Style: s.Style})
 		}
 		return spans
@@ -108,22 +149,30 @@ func (h *Highlighter) computeSpans(line string, inBlock bool) []Span {
 
 	spans := h.lexLine(line)
 	open := h.opensAt(line)
-	if open < 0 {
+	if open.region < 0 {
 		return spans
 	}
-	// Comment opens here and runs past end of line. Fresh slice: spans is cached.
+	// A region opens here and runs past end of line. Fresh slice: spans is cached.
 	out := make([]Span, 0, len(spans)+1)
 	for _, s := range spans {
-		if s.End <= open {
+		if s.End <= open.col {
 			out = append(out, s)
-		} else if s.Start < open {
-			out = append(out, Span{Start: s.Start, End: open, Style: s.Style})
+		} else if s.Start < open.col {
+			out = append(out, Span{Start: s.Start, End: open.col, Style: s.Style})
 		}
 	}
-	return append(out, Span{Start: open, End: len([]rune(line)), Style: term.StyleSyntaxComment})
+	style := h.regions[open.region].style
+	return append(out, Span{Start: open.col, End: len([]rune(line)), Style: style})
 }
 
-func (h *Highlighter) lexLine(line string) []Span {
+// A third-party XML lexer can panic mid-tokenise (missing `using` delegate,
+// bad state). Losing color on one line beats taking the editor down.
+func (h *Highlighter) lexLine(line string) (spansOut []Span) {
+	defer func() {
+		if recover() != nil {
+			spansOut = nil
+		}
+	}()
 	iter, err := h.lexer.Tokenise(nil, line+"\n")
 	if err != nil {
 		return nil
@@ -149,19 +198,19 @@ func (h *Highlighter) lexLine(line string) []Span {
 	return spans
 }
 
-// stateAt reports whether lines[idx] starts inside a block comment, extending
-// the state table as needed. Transitions are memoized, so this is a map lookup
-// per line rather than a re-lex.
-func (h *Highlighter) stateAt(lines []string, idx int) bool {
-	if h.blockOpen == "" || idx <= 0 {
-		return false
+// stateAt reports which region lines[idx] starts inside, extending the state
+// table as needed. Transitions are memoized, so this is a map lookup per line
+// rather than a re-lex.
+func (h *Highlighter) stateAt(lines []string, idx int) int8 {
+	if len(h.regions) == 0 || idx <= 0 {
+		return noRegion
 	}
 	if h.statesDirty {
 		h.statesDirty = false
 		h.truncateToEdit(lines)
 	}
 	if len(h.states) == 0 {
-		h.states = append(h.states, false)
+		h.states = append(h.states, noRegion)
 	}
 	for len(h.states) <= idx && len(h.states) <= len(lines) {
 		i := len(h.states) - 1
@@ -171,7 +220,7 @@ func (h *Highlighter) stateAt(lines []string, idx int) bool {
 	if idx < len(h.states) {
 		return h.states[idx]
 	}
-	return false
+	return noRegion
 }
 
 // truncateToEdit drops the state table from the first line whose text changed,
@@ -179,7 +228,7 @@ func (h *Highlighter) stateAt(lines []string, idx int) bool {
 // Go's identical-pointer fast path, so unchanged lines cost no scanning.
 func (h *Highlighter) truncateToEdit(lines []string) {
 	keep := min(len(h.stateSrc), len(lines))
-	for i := 0; i < keep; i++ {
+	for i := range keep {
 		if h.stateSrc[i] != lines[i] {
 			keep = i
 			break
@@ -191,61 +240,122 @@ func (h *Highlighter) truncateToEdit(lines []string) {
 	}
 }
 
-// nextState advances block comment state across one line.
-func (h *Highlighter) nextState(line string, inBlock bool) bool {
-	for inBlock {
-		end := h.closesAt(line)
+// nextState advances region state across one line.
+func (h *Highlighter) nextState(line string, reg int8) int8 {
+	for reg >= 0 && int(reg) < len(h.regions) {
+		end := closesAt(line, h.regions[reg])
 		if end < 0 {
-			return true
+			return reg
 		}
 		line = string([]rune(line)[end:])
-		inBlock = false
+		reg = noRegion
 	}
-	return h.opensAt(line) >= 0
+	return h.opensAt(line).region
 }
 
-// closesAt returns the rune index just past the closing delimiter, or -1.
-// A plain search is correct: nothing is special inside a block comment.
-func (h *Highlighter) closesAt(line string) int {
-	if h.blockClose == "" {
+// closesAt returns the rune index just past the region's closing delimiter, or
+// -1. Only a string region honours backslash escapes; inside a comment nothing
+// is special, so that case is a plain substring search. Neither path
+// materialises the line as runes: this runs once per line when the state table
+// is rebuilt over a whole buffer.
+func closesAt(line string, r region) int {
+	if r.close == "" {
 		return -1
 	}
-	i := strings.Index(line, h.blockClose)
-	if i < 0 {
-		return -1
+	if !r.escapes {
+		i := strings.Index(line, r.close)
+		if i < 0 {
+			return -1
+		}
+		return utf8.RuneCountInString(line[:i+len(r.close)])
 	}
-	return len([]rune(line[:i+len(h.blockClose)]))
+	runes := 0
+	for i := 0; i < len(line); {
+		if line[i] == '\\' {
+			i++
+			runes++
+			if i < len(line) {
+				_, w := utf8.DecodeRuneInString(line[i:])
+				i += w
+				runes++
+			}
+			continue
+		}
+		if strings.HasPrefix(line[i:], r.close) {
+			return runes + utf8.RuneCountInString(r.close)
+		}
+		_, w := utf8.DecodeRuneInString(line[i:])
+		i += w
+		runes++
+	}
+	return -1
 }
 
-// opensAt returns the rune index where line opens an unclosed block comment,
-// or -1. Appending the closer makes the comment well formed, so chroma's own
-// rules decide: an opener inside a string or after a line comment is ignored.
-func (h *Highlighter) opensAt(line string) int {
-	if h.blockOpen == "" || !strings.Contains(line, h.blockOpen) {
-		return -1
+func (h *Highlighter) opensAt(line string) openAt {
+	// Fast path, and the common one: no delimiter on the line means no lex
+	// and no cache entry, which keeps rebuilding the state table over a large
+	// buffer to one scan per line.
+	if !h.mayOpen(line) {
+		return noOpen
 	}
-	if idx, ok := h.opens[line]; ok {
-		return idx
+	if at, ok := h.opens[line]; ok {
+		return at
 	}
-	idx := h.computeOpensAt(line)
+	at := h.computeOpensAt(line)
 	if h.opens == nil {
-		h.opens = make(map[string]int)
+		h.opens = make(map[string]openAt)
 	}
-	h.opens[line] = idx
-	return idx
+	h.opens[line] = at
+	return at
 }
 
-func (h *Highlighter) computeOpensAt(line string) int {
-	iter, err := h.lexer.Tokenise(nil, line+h.blockClose)
+// mayOpen is the line's first filter: one pass looking for the leading byte of
+// any region's opening delimiter.
+func (h *Highlighter) mayOpen(line string) bool {
+	return h.openLeads != "" && strings.ContainsAny(line, h.openLeads)
+}
+
+// computeOpensAt returns the earliest region the line opens and never closes.
+// Appending the closer makes the region well formed, so chroma's own rules
+// decide: an opener inside a string or after a line comment is ignored. For a
+// symmetric delimiter such as a backtick the appended closer can itself look
+// like an opener, which is why an opener at or past the end of the original
+// line is rejected.
+func (h *Highlighter) computeOpensAt(line string) openAt {
+	best := noOpen
+	lineLen := len([]rune(line))
+	for i := range h.regions {
+		r := h.regions[i]
+		if !strings.Contains(line, r.open) {
+			continue
+		}
+		if best.col >= 0 && strings.Index(line, r.open) > best.col {
+			continue
+		}
+		start := h.trailingRegionStart(line+r.close, r)
+		if start < 0 || start >= lineLen {
+			continue
+		}
+		if best.col < 0 || start < best.col {
+			best = openAt{col: start, region: int8(i)}
+		}
+	}
+	return best
+}
+
+// trailingRegionStart returns the rune index where the region that reaches the
+// end of text begins, or -1 when the text does not end inside one.
+func (h *Highlighter) trailingRegionStart(text string, r region) int {
+	iter, err := h.lexer.Tokenise(nil, text)
 	if err != nil {
 		return -1
 	}
 	pos, start := 0, -1
 	for _, tok := range iter.Tokens() {
 		switch {
-		case isCommentToken(tok.Type) && strings.HasPrefix(tok.Value, h.blockOpen):
+		case tok.Type == r.tokenType && strings.HasPrefix(tok.Value, r.open):
 			start = pos
-		case !isCommentToken(tok.Type):
+		case tok.Type != r.tokenType:
 			start = -1
 		}
 		pos += len([]rune(tok.Value))
@@ -253,40 +363,97 @@ func (h *Highlighter) computeOpensAt(line string) int {
 	return start
 }
 
-// Probed in order to discover the language's block comment delimiters.
-var blockCommentCandidates = [][2]string{
-	{"/*", "*/"},
-	{"<!--", "-->"},
-	{"{-", "-}"},
-	{"(*", "*)"},
-	{"--[[", "]]"},
-	{"<#", "#>"},
+// Probed in order to discover which multi-line regions the language has. The
+// probe spans two lines because a single-line construct cannot, which is what
+// stops Haskell's "--" from matching the "--[[" candidate.
+//
+// A symmetric delimiter needs a second, stricter test. Chroma coalesces
+// adjacent tokens of the same type, so `""" a\nb """` looks like one string
+// in Go and Rust, neither of which has a triple-quoted literal; they read it
+// as `""`, `" a\nb "`, `""`. Requiring the raw lexer to emit the delimiter as
+// a token of its own separates a real region, where the opener pushes a
+// state, from three literals in a row.
+var regionCandidates = []struct {
+	open      string
+	close     string
+	style     term.Style
+	escapes   bool
+	ownsDelim bool
+	match     func(chroma.TokenType) bool
+}{
+	{open: "/*", close: "*/", style: term.StyleSyntaxComment, match: isCommentToken},
+	{open: "<!--", close: "-->", style: term.StyleSyntaxComment, match: isCommentToken},
+	{open: "{-", close: "-}", style: term.StyleSyntaxComment, match: isCommentToken},
+	{open: "(*", close: "*)", style: term.StyleSyntaxComment, match: isCommentToken},
+	{open: "--[[", close: "]]", style: term.StyleSyntaxComment, match: isCommentToken},
+	{open: "<#", close: "#>", style: term.StyleSyntaxComment, match: isCommentToken},
+	{open: `"""`, close: `"""`, style: term.StyleSyntaxString, escapes: true, ownsDelim: true, match: isStringToken},
+	{open: "'''", close: "'''", style: term.StyleSyntaxString, escapes: true, ownsDelim: true, match: isStringToken},
+	{open: "`", close: "`", style: term.StyleSyntaxString, escapes: true, ownsDelim: true, match: isStringToken},
 }
 
-// detectBlockComment finds which candidate pair the lexer honours. Chroma's
-// comment rules vary too much in shape to read delimiters off directly.
-// The probe spans two lines because a line comment cannot, which stops
-// Haskell's "--" from matching the "--[[" candidate.
-func detectBlockComment(lx chroma.Lexer) (string, string) {
-	for _, c := range blockCommentCandidates {
-		probe := c[0] + " a\nb " + c[1]
-		iter, err := lx.Tokenise(nil, probe)
-		if err != nil {
+// detectRegions takes the raw lexer, not a coalesced one, and coalesces it
+// itself: the two views answer different questions.
+func detectRegions(raw chroma.Lexer) []region {
+	coalesced := chroma.Coalesce(raw)
+	var out []region
+	for _, c := range regionCandidates {
+		probe := c.open + " a\nb " + c.close
+		tok, ok := wholeTextToken(coalesced, probe)
+		if !ok || !c.match(tok.Type) {
 			continue
 		}
-		toks := iter.Tokens()
-		if len(toks) == 0 {
+		if c.ownsDelim && !emitsDelimToken(raw, probe, c.open) {
 			continue
 		}
-		if isCommentToken(toks[0].Type) && len([]rune(toks[0].Value)) >= len([]rune(probe)) {
-			return c[0], c[1]
-		}
+		out = append(out, region{
+			open:      c.open,
+			close:     c.close,
+			style:     c.style,
+			tokenType: tok.Type,
+			escapes:   c.escapes,
+		})
 	}
-	return "", ""
+	return out
+}
+
+// wholeTextToken reports the first token when it covers the whole text, which
+// is what "the lexer reads this as one region" means.
+func wholeTextToken(lx chroma.Lexer, text string) (chroma.Token, bool) {
+	iter, err := lx.Tokenise(nil, text)
+	if err != nil {
+		return chroma.Token{}, false
+	}
+	toks := iter.Tokens()
+	if len(toks) == 0 {
+		return chroma.Token{}, false
+	}
+	return toks[0], len([]rune(toks[0].Value)) >= len([]rune(text))
+}
+
+// emitsDelimToken reports whether the lexer opens the probe by emitting the
+// delimiter as a token of its own. Leading empty tokens, such as Python's
+// string affix, are skipped.
+func emitsDelimToken(lx chroma.Lexer, probe, delim string) bool {
+	iter, err := lx.Tokenise(nil, probe)
+	if err != nil {
+		return false
+	}
+	for _, tok := range iter.Tokens() {
+		if tok.Value == "" {
+			continue
+		}
+		return tok.Value == delim
+	}
+	return false
 }
 
 func isCommentToken(t chroma.TokenType) bool {
 	return t == chroma.Comment || t.InSubCategory(chroma.Comment)
+}
+
+func isStringToken(t chroma.TokenType) bool {
+	return t == chroma.LiteralString || t.InSubCategory(chroma.LiteralString)
 }
 
 func mapTokenType(t chroma.TokenType) term.Style {
