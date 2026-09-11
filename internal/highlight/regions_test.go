@@ -64,6 +64,27 @@ func TestPythonDocstringSpansLines(t *testing.T) {
 	}
 }
 
+// Python has two docstring delimiters and the table carried only one: the
+// ”' entry was a mistyped Go literal that compiled, leaving its closer empty.
+func TestPythonSingleQuoteDocstringSpansLines(t *testing.T) {
+	lines := []string{`def f():`, `    '''`, `    docs`, `    '''`, `    return 1`}
+	h := New("mod.py")
+	allStyled(t, h.HighlightLineAt(lines, 2), lines[2], term.StyleSyntaxString, "inside docstring")
+	if got := styleAt(h.HighlightLineAt(lines, 4), 4); got != term.StyleSyntaxKeyword {
+		t.Errorf("line after the docstring = %v, want keyword", got)
+	}
+}
+
+// An empty delimiter never closes, so its region would swallow the rest of
+// the buffer. Go accepts the literal that causes it, so assert the table.
+func TestRegionCandidatesHaveBothDelimiters(t *testing.T) {
+	for _, c := range regionCandidates {
+		if c.open == "" || c.close == "" {
+			t.Errorf("candidate %q..%q has an empty delimiter", c.open, c.close)
+		}
+	}
+}
+
 // Chroma coalesces adjacent strings, so `""" a\nb """` reads as one token in
 // languages that have no triple-quoted literal. Those must not gain a region.
 func TestLanguagesWithoutTripleQuoteRegion(t *testing.T) {

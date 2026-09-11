@@ -351,7 +351,7 @@ var regionCandidates = []struct {
 	{open: "--[[", close: "]]", style: term.StyleSyntaxComment, comment: true},
 	{open: "<#", close: "#>", style: term.StyleSyntaxComment, comment: true},
 	{open: `"""`, close: `"""`, style: term.StyleSyntaxString, ownsDelim: true},
-	{open: ", close: ", style: term.StyleSyntaxString, ownsDelim: true},
+	{open: `'''`, close: `'''`, style: term.StyleSyntaxString, ownsDelim: true},
 	{open: "`", close: "`", style: term.StyleSyntaxString, ownsDelim: true},
 }
 
