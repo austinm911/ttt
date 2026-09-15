@@ -129,6 +129,98 @@ func TestEarliestRegionWins(t *testing.T) {
 	allStyled(t, h.HighlightLineAt(lines, 1), lines[1], term.StyleSyntaxString, "template beats comment")
 }
 
+// A region that closes at the very end of its line: the closer appended to
+// probe for an open region coalesces with the closer already there, so the
+// lexer reports a region starting before end of line and the state leaked
+// into the next one. TestClosedTemplateDoesNotOpenRegion misses this because
+// its trailing ";" breaks the coalescing.
+func TestRegionClosedAtEndOfLineDoesNotLeak(t *testing.T) {
+	for _, tc := range []struct {
+		file  string
+		lines []string
+		want  term.Style
+	}{
+		{"a.js", []string{"const a = `x`", "const b = 2;"}, term.StyleSyntaxKeyword},
+		{"a.go", []string{"q := `select 1`", "func main() {}"}, term.StyleSyntaxKeyword},
+		{"a.py", []string{`x = """abc"""`, `def f(): pass`}, term.StyleSyntaxKeyword},
+		{"a.py", []string{`x = '''abc'''`, `def f(): pass`}, term.StyleSyntaxKeyword},
+		{"a.lua", []string{"x = --[[ a ]]", "local y = 2"}, term.StyleSyntaxKeyword},
+	} {
+		h := New(tc.file)
+		if got := styleAt(h.HighlightLineAt(tc.lines, 1), 0); got != tc.want {
+			t.Errorf("%s: line after %q = %v, want %v", tc.file, tc.lines[0], got, tc.want)
+		}
+	}
+}
+
+// A half-written delimiter must not become a whole one: the probe appends the
+// closer, so a line ending in "" would otherwise open a Python docstring.
+func TestAppendedCloserCannotCompleteAnOpener(t *testing.T) {
+	for _, tc := range []struct {
+		file  string
+		lines []string
+	}{
+		{"a.py", []string{`x = ""`, `def f(): pass`}},
+		{"a.js", []string{"const a = ``", "const b = 2;"}},
+		{"a.js", []string{"code(); /", "const b = 2;"}},
+	} {
+		h := New(tc.file)
+		if got := styleAt(h.HighlightLineAt(tc.lines, 1), 0); got != term.StyleSyntaxKeyword {
+			t.Errorf("%s: line after %q = %v, want keyword", tc.file, tc.lines[0], got)
+		}
+	}
+}
+
+// Rejecting a line because it closes a region must not reject the line: a
+// later opener on the same line still carries.
+func TestRegionReopenedAfterClosingOnSameLine(t *testing.T) {
+	for _, tc := range []struct {
+		file  string
+		lines []string
+	}{
+		{"a.js", []string{"const a = `x`; const b = `y", "still string"}},
+		{"a.js", []string{"/*a*/ /*b*/ /*c", "still comment"}},
+		{"a.py", []string{`s = '''a''' + """b`, `still string`}},
+	} {
+		h := New(tc.file)
+		want := term.StyleSyntaxString
+		if tc.lines[0] == "/*a*/ /*b*/ /*c" {
+			want = term.StyleSyntaxComment
+		}
+		allStyled(t, h.HighlightLineAt(tc.lines, 1), tc.lines[1], want, tc.file+" reopened region")
+	}
+}
+
+// The triple-quote probe is conservative by design: coalescing makes a run of
+// short literals look like one region, so a language only gains the region
+// when its lexer emits the delimiter as its own token. This is the matrix the
+// PR body claims.
+func TestTripleQuoteRegionLanguageMatrix(t *testing.T) {
+	for file, want := range map[string]bool{
+		"a.py":    true,
+		"a.kt":    true,
+		"a.swift": false,
+		"a.scala": false,
+		"a.java":  false,
+		"a.go":    false,
+		"a.rs":    false,
+	} {
+		h := New(file)
+		if h == nil {
+			t.Fatalf("no lexer for %s", file)
+		}
+		got := false
+		for _, r := range h.regions {
+			if r.open == `"""` {
+				got = true
+			}
+		}
+		if got != want {
+			t.Errorf(`%s: """ region = %v, want %v`, file, got, want)
+		}
+	}
+}
+
 // Go raw strings have no escapes, so a backslash before the closing backtick
 // must not swallow it. Guessing left the region open for the whole buffer.
 func TestGoRawStringCloserIsNotEscaped(t *testing.T) {

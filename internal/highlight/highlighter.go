@@ -291,20 +291,26 @@ func (h *Highlighter) opensAt(line string) openAt {
 
 // computeOpensAt returns the earliest region the line opens and never closes.
 // Appending the closer makes the region well formed, so chroma's own rules
-// decide: an opener inside a string or after a line comment is ignored. For a
-// symmetric delimiter such as a backtick the appended closer can itself look
-// like an opener, which is why an opener at or past the end of the original
-// line is rejected.
+// decide whether the opener is real: one inside a string or after a line
+// comment is ignored. The lexer is asked where a region starts and never
+// whether it ends, because the appended closer coalesces with a closer the
+// line already had; closesAt, the same oracle nextState and computeSpans use
+// to end a region, decides that. An opener that only exists because the
+// appended closer completed it is not on the line at all.
 func (h *Highlighter) computeOpensAt(line string) openAt {
 	best := noOpen
-	lineLen := len([]rune(line))
+	runes := []rune(line)
 	for i := range h.regions {
 		r := h.regions[i]
 		if !strings.Contains(line, r.open) {
 			continue
 		}
 		start := h.trailingRegionStart(line+r.close, r)
-		if start < 0 || start >= lineLen {
+		after := start + len([]rune(r.open))
+		if start < 0 || after > len(runes) {
+			continue
+		}
+		if closesAt(string(runes[after:]), r) >= 0 {
 			continue
 		}
 		if best.col < 0 || start < best.col {
